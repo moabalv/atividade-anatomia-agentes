@@ -1,6 +1,7 @@
 import inspect
 import json
 import os
+import re
 
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -16,19 +17,42 @@ openai_client = OpenAI(
 
 SYSTEM_PROMPT = """
 You are a coding assistant whose goal it is to help us solve coding tasks.
-You have access to a series of tools you can execute. Hear are the tools you can execute:
+You can perform actions by emitting a single command line in exactly this format, and nothing else on that line:
+
+tool: NAME({{"arg": "value"}})
+
+Do not use JSON function-calling, a <tool_call> tag, or any other structured tool-call format your training may default to.
+The ONLY format the system running you understands is the plain text line above.
+
+Available commands:
 
 {tool_list_repr}
 
-When you want to use a tool, reply with exactly one line in the format: 'tool: TOOL_NAME({{JSON_ARGS}})' and nothing else.
-Use compact single-line JSON with double quotes. After receiving a tool_result(...) message, continue the task.
-If no tool is needed, respond normally.
+Example of a correct response when you want to read a file named 'notes.txt':
+tool: read_file({{"filename": "notes.txt"}})
+
+Use compact single-line JSON with double quotes. After receiving a tool_result(...) message, continue the task using the same format when another action is needed.
+If no action is needed, respond in plain prose.
 """
 
 
 YOU_COLOR = "\u001b[94m"
 ASSISTANT_COLOR = "\u001b[93m"
+THOUGHT_COLOR = "\u001b[95m"
+OBSERVATION_COLOR = "\u001b[92m"
 RESET_COLOR = "\u001b[0m"
+
+TRACE_FILE = Path("output.txt")
+ANSI_ESCAPE_RE = re.compile(r"\u001b\[[0-9;]*m")
+
+def log(message: str) -> None:
+    """
+    Prints 'message' with ANSI colors on the terminal and appends the same
+    text without escape codes to TRACE_FILE, so the run keeps a clean trace.
+    """
+    print(message)
+    with TRACE_FILE.open("a", encoding="utf-8") as f:
+        f.write(ANSI_ESCAPE_RE.sub("", message) + "\n")
 
 def resolve_abs_path(path_str: str) -> Path:
     """
@@ -46,7 +70,7 @@ def read_file_tool(filename: str) -> Dict[str, Any]:
     :return: The full content of the file.
     """
     full_path = resolve_abs_path(filename)
-    print(full_path)
+    log(str(full_path))
     with open(str(full_path), "r") as f:
         content = f.read()
     return {
@@ -146,16 +170,34 @@ def extract_tool_invocations(text: str) -> List[Tuple[str, Dict[str, Any]]]:
             continue
     return invocations
 
+def split_thought_and_tool_calls(text: str) -> Tuple[str, List[str]]:
+    """
+    Split an assistant response into the reasoning written before the tool
+    calls and the raw 'tool: name({...})' lines. Lines starting with 'tool:'
+    that the parser cannot understand stay in the thought, so malformed calls
+    remain visible in the trace.
+    """
+    thought_lines = []
+    tool_call_lines = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("tool:") and extract_tool_invocations(line):
+            tool_call_lines.append(line)
+        else:
+            thought_lines.append(raw_line)
+    return "\n".join(thought_lines).strip(), tool_call_lines
+
 def execute_llm_call(conversation: List[Dict[str, str]]):
     response = openai_client.chat.completions.create(
-        model="openai/gpt-oss-120b",
+        model="qwen/qwen3.8-27b",
         messages=conversation,
         max_completion_tokens=2000,
     )
     return response.choices[0].message.content
 
 def run_coding_agent_loop():
-    print(get_full_system_prompt())
+    TRACE_FILE.write_text("", encoding="utf-8")
+    log(get_full_system_prompt())
     conversation = [{
         "role": "system",
         "content": get_full_system_prompt()
@@ -171,21 +213,23 @@ def run_coding_agent_loop():
         })
         while True:
             assistant_response = execute_llm_call(conversation)
-            print(f"Thought: {assistant_response}")
+            thought, tool_call_lines = split_thought_and_tool_calls(assistant_response)
 
             tool_invocations = extract_tool_invocations(assistant_response)
             if not tool_invocations:
-                print(f"{ASSISTANT_COLOR}Assistant:{RESET_COLOR}: {assistant_response}")
+                log(f"{ASSISTANT_COLOR}Assistant:{RESET_COLOR}: {assistant_response}")
                 conversation.append({
                     "role": "assistant",
                     "content": assistant_response
                 })
                 break
-            for name, args in tool_invocations:
+            if thought:
+                log(f"{THOUGHT_COLOR}Thought:{RESET_COLOR} {thought}")
+            for (name, args), tool_call_line in zip(tool_invocations, tool_call_lines):
 
                 tool = TOOL_REGISTRY[name]
                 resp = ""
-                print(f"Action: {name}, arguments: {args}")
+                log(f"Action: {tool_call_line}")
                 if name == "read_file":
                     resp = tool(args.get("filename", "."))
                 elif name == "list_files":
@@ -194,7 +238,7 @@ def run_coding_agent_loop():
                     resp = tool(args.get("path", "."),
                                 args.get("old_str", ""),
                                 args.get("new_str", ""))
-                print(f"Observations: {json.dumps(resp)}")
+                log(f"{OBSERVATION_COLOR}Observations:{RESET_COLOR} {json.dumps(resp)}")
                 conversation.append({
                     "role": "user",
                     "content": f"tool_result({json.dumps(resp)})"
